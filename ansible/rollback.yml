@@ -1,0 +1,96 @@
+---
+- name: Rollback Cartoon Animation Web deployment
+  hosts: ecs_cluster
+  gather_facts: no
+  vars:
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1') }}"
+    ecs_cluster: "cartoon-cluster"
+    ecs_service: "cartoon-web-service"
+
+  tasks:
+    - name: Configure AWS credentials
+      ansible.builtin.set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+    - name: Fail if AWS credentials not set
+      ansible.builtin.fail:
+        msg: "AWS credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
+      when: aws_access_key == "" or aws_secret_key == ""
+
+    - name: Get current service status
+      community.aws.ecs_service_info:
+        cluster: "{{ ecs_cluster }}"
+        services: "{{ ecs_service }}"
+        region: "{{ aws_region }}"
+      register: current_service
+
+    - name: Get previous task definition
+      community.aws.ecs_taskdefinition_info:
+        family: "cartoon-animation-web-task"
+        status: "ACTIVE"
+        region: "{{ aws_region }}"
+      register: task_definitions
+
+    - name: Set previous task definition ARN
+      ansible.builtin.set_fact:
+        previous_task_def: "{{ task_definitions.task_definitions[1].task_definition_arn }}"
+      when: task_definitions.task_definitions | length > 1
+
+    - name: Fail if no previous task definition found
+      ansible.builtin.fail:
+        msg: "No previous task definition found for rollback"
+      when: task_definitions.task_definitions | length <= 1
+
+    - name: Rollback to previous task definition
+      community.aws.ecs_service:
+        name: "{{ ecs_service }}"
+        cluster: "{{ ecs_cluster }}"
+        task_definition: "{{ previous_task_def }}"
+        desired_count: "{{ current_service.services[0].desiredCount }}"
+        region: "{{ aws_region }}"
+        deployment_configuration:
+          maximum_percent: 200
+          minimum_healthy_percent: 50
+          deployment_circuit_breaker:
+            enable: true
+            rollback: true
+      register: rollback_update
+
+    - name: Wait for rollback to complete
+      community.aws.ecs_service:
+        name: "{{ ecs_service }}"
+        cluster: "{{ ecs_cluster }}"
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 600
+
+    - name: Get updated service status
+      community.aws.ecs_service_info:
+        cluster: "{{ ecs_cluster }}"
+        services: "{{ ecs_service }}"
+        region: "{{ aws_region }}"
+      register: updated_service
+
+    - name: Display rollback results
+      ansible.builtin.debug:
+        msg: |
+          Rollback completed!
+          Previous Task Definition: {{ previous_task_def }}
+          Service Status: {{ updated_service.services[0].status }}
+          Running Count: {{ updated_service.services[0].runningCount }}
+
+    - name: Send rollback notification
+      ansible.builtin.uri:
+        url: "{{ slack_webhook_url | default('') }}"
+        method: POST
+        body_format: json
+        body:
+          text: |
+            🔄 **Rollback Completed**
+            Application: Cartoon Animation Web
+            Previous Task Definition: {{ previous_task_def }}
+            Status: {{ updated_service.services[0].status }}
+        status_code: 200
+      when: slack_webhook_url is defined and slack_webhook_url != ""
+      ignore_errors: yes

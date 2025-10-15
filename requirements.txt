@@ -1,0 +1,11 @@
+# AI Analysis Dependencies
+openai==0.28.1
+boto3==1.34.0
+requests==2.31.0
+
+# Monitoring Dependencies
+psutil==5.9.6
+python-dateutil==2.8.2
+
+# Health Check Dependencies
+urllib3==2.0.7

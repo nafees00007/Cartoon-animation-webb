@@ -1,0 +1,141 @@
+---
+- name: Deploy Cartoon Animation Web to ECS
+  hosts: ecs_cluster
+  gather_facts: no
+  vars:
+    aws_region: "{{ lookup('env', 'AWS_DEFAULT_REGION') | default('us-east-1') }}"
+    ecs_cluster: "cartoon-cluster"
+    ecs_service: "cartoon-web-service"
+    ecr_repository: "cartoon-animation-web"
+    image_tag: "{{ image_tag | default('latest') }}"
+    deployment_strategy: "{{ deployment_strategy | default('FULL_ROLLOUT') }}"
+
+  tasks:
+    - name: Configure AWS credentials
+      ansible.builtin.set_fact:
+        aws_access_key: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+        aws_secret_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+    - name: Fail if AWS credentials not set
+      ansible.builtin.fail:
+        msg: "AWS credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
+      when: aws_access_key == "" or aws_secret_key == ""
+
+    - name: Get current task definition
+      community.aws.ecs_taskdefinition_info:
+        cluster: "{{ ecs_cluster }}"
+        service: "{{ ecs_service }}"
+      register: current_task_def
+      ignore_errors: yes
+
+    - name: Get ECR repository URI
+      community.aws.ecr_info:
+        name: "{{ ecr_repository }}"
+        region: "{{ aws_region }}"
+      register: ecr_info
+
+    - name: Set ECR URI
+      ansible.builtin.set_fact:
+        ecr_uri: "{{ ecr_info.repositories[0].repositoryUri }}"
+
+    - name: Get latest task definition ARN
+      community.aws.ecs_taskdefinition_info:
+        family: "cartoon-animation-web-task"
+        status: "ACTIVE"
+        region: "{{ aws_region }}"
+      register: task_definitions
+
+    - name: Set task definition ARN
+      ansible.builtin.set_fact:
+        task_def_arn: "{{ task_definitions.task_definitions[0].task_definition_arn }}"
+
+    - name: Update ECS service with new image
+      community.aws.ecs_service:
+        name: "{{ ecs_service }}"
+        cluster: "{{ ecs_cluster }}"
+        task_definition: "{{ task_def_arn }}"
+        desired_count: "{{ 2 if deployment_strategy == 'FULL_ROLLOUT' else 1 }}"
+        region: "{{ aws_region }}"
+        deployment_configuration:
+          maximum_percent: 200
+          minimum_healthy_percent: 50
+          deployment_circuit_breaker:
+            enable: true
+            rollback: true
+      register: service_update
+
+    - name: Wait for service to stabilize
+      community.aws.ecs_service:
+        name: "{{ ecs_service }}"
+        cluster: "{{ ecs_cluster }}"
+        region: "{{ aws_region }}"
+        wait: true
+        wait_timeout: 600
+
+    - name: Get service status
+      community.aws.ecs_service_info:
+        cluster: "{{ ecs_cluster }}"
+        services: "{{ ecs_service }}"
+        region: "{{ aws_region }}"
+      register: service_info
+
+    - name: Display service status
+      ansible.builtin.debug:
+        msg: |
+          Service Status: {{ service_info.services[0].status }}
+          Running Count: {{ service_info.services[0].runningCount }}
+          Desired Count: {{ service_info.services[0].desiredCount }}
+          Task Definition: {{ service_info.services[0].taskDefinition }}
+
+    - name: Get load balancer DNS name
+      community.aws.elb_application_lb_info:
+        region: "{{ aws_region }}"
+        names: "cartoon-animation-web-alb"
+      register: alb_info
+
+    - name: Set ALB DNS name
+      ansible.builtin.set_fact:
+        alb_dns: "{{ alb_info.load_balancers[0].dns_name }}"
+
+    - name: Wait for health check to pass
+      ansible.builtin.uri:
+        url: "http://{{ alb_dns }}/"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_check
+      retries: 30
+      delay: 10
+      until: health_check.status == 200
+      ignore_errors: yes
+
+    - name: Display deployment results
+      ansible.builtin.debug:
+        msg: |
+          Deployment completed!
+          Application URL: http://{{ alb_dns }}
+          Image Tag: {{ image_tag }}
+          Deployment Strategy: {{ deployment_strategy }}
+          Service Status: {{ service_info.services[0].status }}
+
+    - name: Fail if health check failed
+      ansible.builtin.fail:
+        msg: "Health check failed after deployment. Check service logs."
+      when: health_check.status != 200
+
+    - name: Send deployment notification
+      ansible.builtin.uri:
+        url: "{{ slack_webhook_url | default('') }}"
+        method: POST
+        body_format: json
+        body:
+          text: |
+            🚀 **Deployment Completed**
+            Application: Cartoon Animation Web
+            Image Tag: {{ image_tag }}
+            URL: http://{{ alb_dns }}
+            Status: {{ service_info.services[0].status }}
+            Strategy: {{ deployment_strategy }}
+        status_code: 200
+      when: slack_webhook_url is defined and slack_webhook_url != ""
+      ignore_errors: yes
